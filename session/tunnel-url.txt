@@ -1,7 +1,8 @@
-TUNNEL_URL=https://careful-law-passage-finances.trycloudflare.com
-HOSTNAME=careful-law-passage-finances.trycloudflare.com
+TUNNEL_URL=https://arguments-great-weight-usb.trycloudflare.com
+HOSTNAME=arguments-great-weight-usb.trycloudflare.com
 USERNAME=runneradmin
 PASSWORD=CloudRdp2026!
 LOCAL_PORT=13389
-RUN_ID=42035891859
-EXPIRES_UTC=2026-11-05T19:27:48.8019042Z
+RDP_LISTENER=True
+RUN_ID=42037396885
+EXPIRES_UTC=2026-11-05T19:37:55.2752364Z
