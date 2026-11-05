@@ -31,7 +31,18 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Write-Host "RDP enabled, NLA on, firewall open"
+          Restart-Service TermService -Force
+          $listen = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) { $listen = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          "RDP_LISTENER=$listen" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not $listen) {
+            Write-Host "::error::RDP listener did not bind on 3389"
+            exit 1
+          }
+          Write-Host "RDP enabled, NLA on, firewall open, listener bound"
 
       - name: Set RDP password
         shell: pwsh
@@ -129,6 +140,7 @@ jobs:
             "USERNAME=runneradmin",
             "PASSWORD=$env:RDP_PASSWORD",
             "LOCAL_PORT=13389",
+            "RDP_LISTENER=$env:RDP_LISTENER",
             "RUN_ID=$env:GITHUB_RUN_ID",
             "EXPIRES_UTC=$((Get-Date).ToUniversalTime().AddHours(6).ToString('o'))"
           ) -join "`n"
