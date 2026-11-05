@@ -53,125 +53,186 @@ jobs:
           Set-LocalUser -Name "runneradmin" -Password $sec
           Write-Host "Password set for runneradmin"
 
-      - name: Start Cloudflare tunnel and capture URL
-        shell: pwsh
-        run: |
-          $log = Join-Path $env:RUNNER_TEMP "cf-tunnel.log"
-          Start-Process -FilePath "cloudflared" `
-            -ArgumentList "tunnel","--url","tcp://localhost:3389" `
-            -RedirectStandardOutput $log -RedirectStandardError "$log.err" `
-            -WindowStyle Hidden
-
-          $url = $null
-          for ($i = 0; $i -lt 40; $i++) {
-            Start-Sleep -Seconds 3
-            $text = ""
-            foreach ($f in @($log, "$log.err")) {
-              if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
-            }
-            if ($text -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
-              $url = $Matches[0]
-              break
-            }
-          }
-
-          if (-not $url) {
-            Write-Host "::error::Tunnel URL not found in cloudflared output"
-            if (Test-Path $log)     { Get-Content $log }
-            if (Test-Path "$log.err") { Get-Content "$log.err" }
-            exit 1
-          }
-
-          "TUNNEL_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "TUNNEL_URL=$url"
-
-      - name: Print connection details
+      - name: Serve RDP session (tunnel + publish + monitor)
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ inputs.rdp_password }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $u = $env:TUNNEL_URL -replace '^https://',''
+          $log = Join-Path $env:RUNNER_TEMP "cf-tunnel.log"
+          $err = "$log.err"
+          $stateFile = Join-Path $env:RUNNER_TEMP "session-state.txt"
+
+          function Start-Tunnel {
+            Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            Remove-Item $log, $err -ErrorAction SilentlyContinue
+            Start-Process -FilePath "cloudflared" `
+              -ArgumentList "tunnel","--url","tcp://localhost:3389" `
+              -RedirectStandardOutput $log -RedirectStandardError $err `
+              -WindowStyle Hidden
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Seconds 3
+              $text = ""
+              foreach ($f in @($log, $err)) {
+                if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
+              }
+              if ($text -match 'https://[a-z0-9-]+\.trycloudflare\.com') { return $Matches[0] }
+            }
+            return $null
+          }
+
+          function Test-RdpLocal {
+            try {
+              $pkt = [byte[]](0x03,0x00,0x00,0x13,0x0E,0xE0,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x08,0x00,0x03,0x00,0x00,0x00)
+              $c = New-Object System.Net.Sockets.TcpClient
+              $c.Connect("127.0.0.1", 3389)
+              $s = $c.GetStream()
+              $s.ReadTimeout = 8000
+              $s.Write($pkt, 0, $pkt.Length)
+              $buf = New-Object byte[] 256
+              $n = $s.Read($buf, 0, 256)
+              $c.Close()
+              return ($n -ge 6 -and $buf[5] -eq 0xD0)
+            } catch { return $false }
+          }
+
+          function Publish {
+            param([string]$Url, [string]$Status, [int]$Restarts, [string]$Debug)
+            $u = $Url -replace '^https://',''
+            $now = (Get-Date).ToUniversalTime()
+            $payload = @(
+              "TUNNEL_URL=$Url",
+              "HOSTNAME=$u",
+              "USERNAME=runneradmin",
+              "PASSWORD=$env:RDP_PASSWORD",
+              "LOCAL_PORT=13389",
+              "RDP_LISTENER=$env:RDP_LISTENER",
+              "RDP_SELFTEST=$script:selfTest",
+              "TUNNEL_STATUS=$Status",
+              "RESTARTS=$Restarts",
+              "RUN_ID=$env:GITHUB_RUN_ID",
+              "HEARTBEAT_UTC=$($now.ToString('o'))",
+              "EXPIRES_UTC=$($now.AddMinutes([Math]::Min($script:minsRemaining, 360)).ToString('o'))",
+              "DEBUG=$Debug"
+            ) -join "`n"
+            $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
+            $body = @{ message = "session $env:GITHUB_RUN_ID $Status $(Get-Date -Format HHmmss)"; content = $b64; branch = "master" }
+            $existing = gh api "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $existing) {
+              $sha = ($existing | ConvertFrom-Json).sha
+              if ($sha) { $body.sha = $sha }
+            }
+            $json = $body | ConvertTo-Json -Compress
+            $json | gh api -X PUT "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" -H "Content-Type: application/json" --input - 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::publish failed (will retry on heartbeat)" }
+          }
+
+          function Get-ErrTail {
+            if (Test-Path $err) {
+              $t = (Get-Content $err -Tail 2 -ErrorAction SilentlyContinue) -join ' | '
+              return ($t -replace '[=,]',' ')
+            }
+            return ""
+          }
+
+          # --- session budget: leave 2 minutes of headroom under the 360 job cap ---
+          $script:minsRemaining = 360
+          if ($env:SESSION_MINUTES -match '^\d+$') {
+            $v = [int]$env:SESSION_MINUTES
+            if ($v -ge 1 -and $v -le 358) { $script:minsRemaining = $v }
+          }
+
+          # --- bring tunnel up ---
+          $url = Start-Tunnel
+          if (-not $url) {
+            Write-Host "::error::Tunnel URL never appeared"
+            Publish -Url "none" -Status "TUNNEL_FAILED" -Restarts 0 -Debug (Get-ErrTail)
+            exit 1
+          }
+          Write-Host "TUNNEL_URL=$url"
+
+          # --- prove RDP answers on this box ---
+          Start-Sleep -Seconds 3
+          $script:selfTest = (Test-RdpLocal)
+          Write-Host "RDP_SELFTEST=$($script:selfTest)"
+          if (-not $script:selfTest) {
+            Write-Host "::warning::Local RDP handshake failed - tunnel is up but RDP may not answer"
+          }
+
+          $restarts = 0
+          Publish -Url $url -Status "LIVE" -Restarts $restarts -Debug (Get-ErrTail)
+
+          # --- banner ---
           $lines = @(
             "============================================",
             "  CLOUD RDP IS LIVE",
             "============================================",
-            "  Tunnel URL : $env:TUNNEL_URL",
-            "  Hostname   : $u",
+            "  Tunnel URL : $url",
+            "  Hostname   : $($url -replace '^https://','')",
             "  Username   : runneradmin",
-            "  Password   : $env:RDP_PASSWORD",
+            "  Password   : $($env:RDP_PASSWORD)",
+            "  RDP self-test: $($script:selfTest)",
             "  OS         : Windows Server 2022 (4 vCPU / 16 GB)",
-            "  Internet   : full, GitHub backbone",
             "============================================",
-            "  CLIENT (run on your PC):",
-            "    cloudflared access tcp --hostname $u --url localhost:13389",
-            "  then open mstsc -> Computer: localhost:13389",
+            "  CLIENT: cloudflared access tcp --hostname $($url -replace '^https://','') --url localhost:13389",
+            "  then mstsc /v:localhost:13389",
             "============================================"
           )
           $lines | ForEach-Object { Write-Host $_ }
+          Write-Host "::notice title=Cloud RDP URL::$url user=runneradmin pass=$($env:RDP_PASSWORD)"
 
           @"
           # Cloud RDP ready
 
           | Field | Value |
           |---|---|
-          | Tunnel | ``$env:TUNNEL_URL`` |
-          | Hostname | ``$u`` |
+          | Tunnel | ``$url`` |
           | Username | ``runneradmin`` |
-          | Password | ``$env:RDP_PASSWORD`` |
+          | Password | ``$($env:RDP_PASSWORD)`` |
+          | RDP self-test | ``$($script:selfTest)`` |
           | Local port | ``13389`` |
-
-          **Client:**
-          ``````bash
-          cloudflared access tcp --hostname $u --url localhost:13389
-          ``````
-          Then ``mstsc /v:localhost:13389``
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Publish session URL
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ inputs.rdp_password }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $u = $env:TUNNEL_URL -replace '^https://',''
-          $payload = @(
-            "TUNNEL_URL=$env:TUNNEL_URL",
-            "HOSTNAME=$u",
-            "USERNAME=runneradmin",
-            "PASSWORD=$env:RDP_PASSWORD",
-            "LOCAL_PORT=13389",
-            "RDP_LISTENER=$env:RDP_LISTENER",
-            "RUN_ID=$env:GITHUB_RUN_ID",
-            "EXPIRES_UTC=$((Get-Date).ToUniversalTime().AddHours(6).ToString('o'))"
-          ) -join "`n"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-          $msg = "session $env:GITHUB_RUN_ID"
-          $body = @{ message = $msg; content = $b64; branch = "master" }
-          $existing = gh api "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" 2>$null
-          if ($LASTEXITCODE -eq 0 -and $existing) {
-            $sha = ($existing | ConvertFrom-Json).sha
-            $body.sha = $sha
-          }
-          $json = $body | ConvertTo-Json -Compress
-          $json | gh api -X PUT "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" -H "Content-Type: application/json" --input -
-          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::Failed to publish URL file"; exit 0 }
-          Write-Host "Published session/tunnel-url.txt"
-          Write-Host "::notice title=Cloud RDP URL::$env:TUNNEL_URL user=runneradmin pass=$env:RDP_PASSWORD"
+          # --- monitor loop: watchdog + heartbeat until session budget is spent ---
+          $start = Get-Date
+          $deadline = $start.AddMinutes($script:minsRemaining)
+          $lastBeat = Get-Date
+          Write-Host "Session live until $deadline ($($script:minsRemaining) min)"
 
-      - name: Keep session alive
-        shell: pwsh
-        env:
-          SESSION_MINUTES: ${{ inputs.session_minutes }}
-        run: |
-          $mins = 360
-          if ($env:SESSION_MINUTES -match '^\d+$') {
-            $v = [int]$env:SESSION_MINUTES
-            if ($v -ge 1 -and $v -le 360) { $mins = $v }
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 30
+
+            $script:minsRemaining = [Math]::Max(1, [int]($deadline - (Get-Date)).TotalMinutes)
+
+            $alive = $null -ne (Get-Process cloudflared -ErrorAction SilentlyContinue)
+            if (-not $alive) {
+              Write-Host "$(Get-Date -Format HH:mm:ss) cloudflared DEAD - restarting tunnel"
+              $restarts++
+              $newUrl = Start-Tunnel
+              if ($newUrl) {
+                $url = $newUrl
+                $script:selfTest = (Test-RdpLocal)
+                Write-Host "TUNNEL_URL=$url (restart #$restarts)"
+                Publish -Url $url -Status "RESTARTED" -Restarts $restarts -Debug (Get-ErrTail)
+                $lastBeat = Get-Date
+                continue
+              } else {
+                Write-Host "::error::tunnel restart failed"
+                Publish -Url $url -Status "TUNNEL_DEAD" -Restarts $restarts -Debug (Get-ErrTail)
+                $lastBeat = Get-Date
+                continue
+              }
+            }
+
+            if (((Get-Date) - $lastBeat).TotalMinutes -ge 5) {
+              $beat = (Get-Date -Format 'HH:mm:ss')
+              Write-Host "$beat active - tunnel up, restarts=$restarts, left=$($script:minsRemaining)min"
+              Publish -Url $url -Status "LIVE" -Restarts $restarts -Debug (Get-ErrTail)
+              $lastBeat = Get-Date
+            }
           }
-          $end = (Get-Date).AddMinutes($mins)
-          Write-Host "Session live until $end (local) - $mins minutes"
-          while ((Get-Date) -lt $end) {
-            Start-Sleep -Seconds 60
-            Write-Host "active $(Get-Date -Format 'HH:mm:ss') / tunnel $env:TUNNEL_URL"
-          }
-          Write-Host "Session window ended - cancel this run if still green"
+
+          Publish -Url $url -Status "SESSION_ENDED" -Restarts $restarts -Debug (Get-ErrTail)
+          Write-Host "Session budget spent - run will complete"
