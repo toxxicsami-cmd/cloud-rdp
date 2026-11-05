@@ -1,0 +1,26 @@
+name: RDP RELAY - fire next session when one ends
+
+on:
+  workflow_run:
+    workflows: ["WINDOWS RDP - CLOUDFLARE"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    # only chain after a session ran its full course; never after a
+    # cancelled run (manual stop) or a broken one (would loop on quota burn)
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Fire next session
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "previous session completed - firing successor in 60s"
+          sleep 60
+          gh workflow run "WINDOWS RDP - CLOUDFLARE" --ref master
+          echo "successor dispatched"
