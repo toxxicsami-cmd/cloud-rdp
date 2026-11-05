@@ -1,0 +1,49 @@
+name: RDP WATCHDOG - heal the chain if it breaks
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  heal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for a live session and re-fire if the chain stalled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # explicit stop sentinel: create session/STOP in the repo to halt auto-heal
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/session/STOP" >/dev/null 2>&1; then
+            echo "session/STOP present - auto-heal disabled, leaving chain halted"
+            exit 0
+          fi
+
+          # a run in progress means the chain is alive
+          inflight=$(gh run list --workflow "WINDOWS RDP - CLOUDFLARE" \
+            --status in_progress --json databaseId --jq 'length')
+          if [ "$inflight" != "0" ]; then
+            echo "session in progress - chain healthy"
+            exit 0
+          fi
+
+          # relay may be mid-handover (60s sleep + queue); newest run younger
+          # than 10 minutes = handover in progress, do not double-fire
+          newest=$(gh run list --workflow "WINDOWS RDP - CLOUDFLARE" --limit 1 \
+            --json databaseId --jq '.[0].databaseId')
+          age=$(gh run view "$newest" --json createdAt --jq '.createdAt')
+          age_s=$(( $(date -u +%s) - $(date -u -d "$age" +%s) ))
+          if [ "$age_s" -lt 600 ]; then
+            echo "newest run is ${age_s}s old - handover window, skipping"
+            exit 0
+          fi
+
+          echo "chain stalled (no run for ${age_s}s) - firing successor"
+          gh workflow run "WINDOWS RDP - CLOUDFLARE" --ref master
+          echo "successor dispatched"

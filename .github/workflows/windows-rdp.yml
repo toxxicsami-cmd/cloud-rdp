@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: "RDP password (Windows complexity: 8+ chars, upper, lower, number, symbol)"
+        description: "Override password (empty = use the RDP_PASSWORD Actions secret)"
         required: false
-        default: "CloudRdp2026!"
+        default: ""
       session_minutes:
         description: "Session length in minutes (max 360 = 6h)"
         required: false
@@ -47,16 +47,19 @@ jobs:
       - name: Set RDP password
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ inputs.rdp_password }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || inputs.rdp_password }}
         run: |
+          if (-not $env:RDP_PASSWORD -or $env:RDP_PASSWORD.Length -lt 8) {
+            Write-Host "::error::No password source - set the RDP_PASSWORD Actions secret"
+            exit 1
+          }
           $sec = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $sec
-          Write-Host "Password set for runneradmin"
+          Write-Host "Password set for runneradmin (source not logged)"
 
       - name: Serve RDP session (tunnel + publish + monitor)
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ inputs.rdp_password }}
           SESSION_MINUTES: ${{ inputs.session_minutes }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -106,7 +109,6 @@ jobs:
               "TUNNEL_URL=$Url",
               "HOSTNAME=$u",
               "USERNAME=runneradmin",
-              "PASSWORD=$env:RDP_PASSWORD",
               "LOCAL_PORT=13389",
               "RDP_LISTENER=$env:RDP_LISTENER",
               "RDP_SELFTEST=$script:selfTest",
@@ -172,7 +174,7 @@ jobs:
             "  Tunnel URL : $url",
             "  Hostname   : $($url -replace '^https://','')",
             "  Username   : runneradmin",
-            "  Password   : $($env:RDP_PASSWORD)",
+            "  Password   : (from RDP_PASSWORD Actions secret - chat handover only)",
             "  RDP self-test: $($script:selfTest)",
             "  OS         : Windows Server 2022 (4 vCPU / 16 GB)",
             "============================================",
@@ -181,7 +183,7 @@ jobs:
             "============================================"
           )
           $lines | ForEach-Object { Write-Host $_ }
-          Write-Host "::notice title=Cloud RDP URL::$url user=runneradmin pass=$($env:RDP_PASSWORD)"
+          Write-Host "::notice title=Cloud RDP URL::$url user=runneradmin"
 
           @"
           # Cloud RDP ready
@@ -190,7 +192,7 @@ jobs:
           |---|---|
           | Tunnel | ``$url`` |
           | Username | ``runneradmin`` |
-          | Password | ``$($env:RDP_PASSWORD)`` |
+          | Password | in Actions secret ``RDP_PASSWORD`` (handover in chat) |
           | RDP self-test | ``$($script:selfTest)`` |
           | Local port | ``13389`` |
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

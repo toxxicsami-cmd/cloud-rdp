@@ -10,7 +10,7 @@ Specs per session: 4 vCPU, 16 GB RAM, 14 GB SSD, Windows Server 2022 Datacenter,
 2. Upload the contents of this folder so the workflow lands at:
    `.github/workflows/windows-rdp.yml`
 3. Repo → **Actions** → select **WINDOWS RDP - CLOUDFLARE** → **Run workflow**
-4. Optional: set your own password in the prompt (default `CloudRdp2026!`)
+4. Optional: set your own password as an input (otherwise the `RDP_PASSWORD` Actions secret is used)
 5. Wait 1–2 minutes. Open the run, the **Print connection details** step shows:
 
 ```
