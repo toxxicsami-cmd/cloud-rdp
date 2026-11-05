@@ -1,0 +1,7 @@
+TUNNEL_URL=https://careful-law-passage-finances.trycloudflare.com
+HOSTNAME=careful-law-passage-finances.trycloudflare.com
+USERNAME=runneradmin
+PASSWORD=CloudRdp2026!
+LOCAL_PORT=13389
+RUN_ID=42035891859
+EXPIRES_UTC=2026-11-05T19:27:48.8019042Z
