@@ -12,6 +12,10 @@ on:
         required: false
         default: "360"
 
+permissions:
+  contents: write
+  actions: read
+
 jobs:
   rdp:
     runs-on: windows-latest
@@ -111,6 +115,36 @@ jobs:
           ``````
           Then ``mstsc /v:localhost:13389``
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Publish session URL
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $u = $env:TUNNEL_URL -replace '^https://',''
+          $payload = @(
+            "TUNNEL_URL=$env:TUNNEL_URL",
+            "HOSTNAME=$u",
+            "USERNAME=runneradmin",
+            "PASSWORD=$env:RDP_PASSWORD",
+            "LOCAL_PORT=13389",
+            "RUN_ID=$env:GITHUB_RUN_ID",
+            "EXPIRES_UTC=$((Get-Date).ToUniversalTime().AddHours(6).ToString('o'))"
+          ) -join "`n"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
+          $msg = "session $env:GITHUB_RUN_ID"
+          $body = @{ message = $msg; content = $b64; branch = "master" }
+          $existing = gh api "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            $sha = ($existing | ConvertFrom-Json).sha
+            $body.sha = $sha
+          }
+          $json = $body | ConvertTo-Json -Compress
+          $json | gh api -X PUT "/repos/$env:GITHUB_REPOSITORY/contents/session/tunnel-url.txt" -H "Content-Type: application/json" --input -
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::Failed to publish URL file"; exit 0 }
+          Write-Host "Published session/tunnel-url.txt"
+          Write-Host "::notice title=Cloud RDP URL::$env:TUNNEL_URL user=runneradmin pass=$env:RDP_PASSWORD"
 
       - name: Keep session alive
         shell: pwsh
