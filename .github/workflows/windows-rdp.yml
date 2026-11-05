@@ -65,16 +65,21 @@ jobs:
         run: |
           $log = Join-Path $env:RUNNER_TEMP "cf-tunnel.log"
           $err = "$log.err"
-          $stateFile = Join-Path $env:RUNNER_TEMP "session-state.txt"
+          $probeLog = Join-Path $env:RUNNER_TEMP "cf-probe.log"
+          $probeErr = "$probeLog.err"
+          $probePort = 13400
+          $script:mainPid = 0
 
           function Start-Tunnel {
+            # clean slate: kills any tunnel or probe client, starts a fresh tunnel
             Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
             Remove-Item $log, $err -ErrorAction SilentlyContinue
-            Start-Process -FilePath "cloudflared" `
+            $p = Start-Process -FilePath "cloudflared" `
               -ArgumentList "tunnel","--url","tcp://localhost:3389" `
               -RedirectStandardOutput $log -RedirectStandardError $err `
-              -WindowStyle Hidden
+              -WindowStyle Hidden -PassThru
+            $script:mainPid = $p.Id
             for ($i = 0; $i -lt 40; $i++) {
               Start-Sleep -Seconds 3
               $text = ""
@@ -86,11 +91,28 @@ jobs:
             return $null
           }
 
-          function Test-RdpLocal {
+          function Start-AccessClient {
+            param([string]$Url)
+            # assumes clean slate (only the main tunnel runs) - never kills by name here
+            $hn = $Url -replace '^https://',''
+            Remove-Item $probeLog, $probeErr -ErrorAction SilentlyContinue
+            Start-Process -FilePath "cloudflared" `
+              -ArgumentList "access","tcp","--hostname",$hn,"--url","localhost:$probePort" `
+              -RedirectStandardOutput $probeLog -RedirectStandardError $probeErr `
+              -WindowStyle Hidden | Out-Null
+            for ($i = 0; $i -lt 20; $i++) {
+              if (Get-NetTCPConnection -LocalPort $probePort -State Listen -ErrorAction SilentlyContinue) { return $true }
+              Start-Sleep -Seconds 1
+            }
+            return $false
+          }
+
+          function Send-RdpProbe {
+            param([int]$Port)
             try {
               $pkt = [byte[]](0x03,0x00,0x00,0x13,0x0E,0xE0,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x08,0x00,0x03,0x00,0x00,0x00)
               $c = New-Object System.Net.Sockets.TcpClient
-              $c.Connect("127.0.0.1", 3389)
+              $c.Connect("127.0.0.1", $Port)
               $s = $c.GetStream()
               $s.ReadTimeout = 8000
               $s.Write($pkt, 0, $pkt.Length)
@@ -100,6 +122,12 @@ jobs:
               return ($n -ge 6 -and $buf[5] -eq 0xD0)
             } catch { return $false }
           }
+
+          function Test-RdpLocal { Send-RdpProbe -Port 3389 }
+
+          # full edge round-trip: runner -> Cloudflare edge -> tunnel -> runner:3389
+          # this is the probe that catches "process alive but origin dead" (HTTP 530)
+          function Test-TunnelChain { Send-RdpProbe -Port $probePort }
 
           function Publish {
             param([string]$Url, [string]$Status, [int]$Restarts, [string]$Debug)
@@ -112,6 +140,7 @@ jobs:
               "LOCAL_PORT=13389",
               "RDP_LISTENER=$env:RDP_LISTENER",
               "RDP_SELFTEST=$script:selfTest",
+              "CHAIN_SELFTEST=$script:chainTest",
               "TUNNEL_STATUS=$Status",
               "RESTARTS=$Restarts",
               "RUN_ID=$env:GITHUB_RUN_ID",
@@ -132,11 +161,14 @@ jobs:
           }
 
           function Get-ErrTail {
-            if (Test-Path $err) {
-              $t = (Get-Content $err -Tail 2 -ErrorAction SilentlyContinue) -join ' | '
-              return ($t -replace '[=,]',' ')
+            $t = ""
+            foreach ($f in @($err, $probeErr)) {
+              if (Test-Path $f) {
+                $last = (Get-Content $f -Tail 1 -ErrorAction SilentlyContinue)
+                if ($last) { $t += ($last -replace '[=,]',' ') + " | " }
+              }
             }
-            return ""
+            return $t
           }
 
           # --- session budget: leave 2 minutes of headroom under the 360 job cap ---
@@ -146,7 +178,7 @@ jobs:
             if ($v -ge 1 -and $v -le 358) { $script:minsRemaining = $v }
           }
 
-          # --- bring tunnel up ---
+          # --- bring tunnel + probe client up ---
           $url = Start-Tunnel
           if (-not $url) {
             Write-Host "::error::Tunnel URL never appeared"
@@ -154,13 +186,16 @@ jobs:
             exit 1
           }
           Write-Host "TUNNEL_URL=$url"
+          $probeUp = Start-AccessClient -Url $url
+          Write-Host "PROBE_CLIENT=$probeUp (port $probePort)"
 
-          # --- prove RDP answers on this box ---
+          # --- prove both legs: direct RDP, and full chain through the edge ---
           Start-Sleep -Seconds 3
-          $script:selfTest = (Test-RdpLocal)
-          Write-Host "RDP_SELFTEST=$($script:selfTest)"
-          if (-not $script:selfTest) {
-            Write-Host "::warning::Local RDP handshake failed - tunnel is up but RDP may not answer"
+          $script:selfTest = Test-RdpLocal
+          $script:chainTest = (Test-TunnelChain)
+          Write-Host "RDP_SELFTEST=$($script:selfTest) CHAIN_SELFTEST=$($script:chainTest)"
+          if (-not $script:chainTest) {
+            Write-Host "::warning::chain probe failed at startup - monitor loop will recycle the tunnel"
           }
 
           $restarts = 0
@@ -175,7 +210,7 @@ jobs:
             "  Hostname   : $($url -replace '^https://','')",
             "  Username   : runneradmin",
             "  Password   : (from RDP_PASSWORD Actions secret - chat handover only)",
-            "  RDP self-test: $($script:selfTest)",
+            "  RDP self-test: $($script:selfTest)  chain self-test: $($script:chainTest)",
             "  OS         : Windows Server 2022 (4 vCPU / 16 GB)",
             "============================================",
             "  CLIENT: cloudflared access tcp --hostname $($url -replace '^https://','') --url localhost:13389",
@@ -194,43 +229,84 @@ jobs:
           | Username | ``runneradmin`` |
           | Password | in Actions secret ``RDP_PASSWORD`` (handover in chat) |
           | RDP self-test | ``$($script:selfTest)`` |
+          | Chain self-test | ``$($script:chainTest)`` |
           | Local port | ``13389`` |
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          # --- monitor loop: watchdog + heartbeat until session budget is spent ---
+          # --- monitor loop: three failure modes, three responses ---
+          #   1. main tunnel process dead (by PID, not name)  -> recycle
+          #   2. process alive but edge round-trip fails 2x   -> recycle (the 530 case)
+          #   3. direct RDP probe fails                       -> restart TermService
           $start = Get-Date
           $deadline = $start.AddMinutes($script:minsRemaining)
           $lastBeat = Get-Date
+          $lastChainCheck = Get-Date
+          $chainFails = 0
           Write-Host "Session live until $deadline ($($script:minsRemaining) min)"
 
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 30
-
             $script:minsRemaining = [Math]::Max(1, [int]($deadline - (Get-Date)).TotalMinutes)
 
-            $alive = $null -ne (Get-Process cloudflared -ErrorAction SilentlyContinue)
-            if (-not $alive) {
-              Write-Host "$(Get-Date -Format HH:mm:ss) cloudflared DEAD - restarting tunnel"
-              $restarts++
-              $newUrl = Start-Tunnel
-              if ($newUrl) {
-                $url = $newUrl
-                $script:selfTest = (Test-RdpLocal)
-                Write-Host "TUNNEL_URL=$url (restart #$restarts)"
-                Publish -Url $url -Status "RESTARTED" -Restarts $restarts -Debug (Get-ErrTail)
-                $lastBeat = Get-Date
-                continue
+            # 1. main tunnel process (exact PID)
+            $mainAlive = $null -ne (Get-Process -Id $script:mainPid -ErrorAction SilentlyContinue)
+            $needRecycle = $false
+            $recycleReason = ""
+            if (-not $mainAlive) {
+              $needRecycle = $true
+              $recycleReason = "main tunnel process dead"
+            }
+
+            # 2. chain health every 60s
+            if (-not $needRecycle -and ((Get-Date) - $lastChainCheck).TotalSeconds -ge 60) {
+              $lastChainCheck = Get-Date
+              if (Test-TunnelChain) {
+                if ($chainFails -gt 0) { Write-Host "$(Get-Date -Format HH:mm:ss) chain recovered" }
+                $chainFails = 0
+                $script:chainTest = $true
               } else {
-                Write-Host "::error::tunnel restart failed"
-                Publish -Url $url -Status "TUNNEL_DEAD" -Restarts $restarts -Debug (Get-ErrTail)
-                $lastBeat = Get-Date
-                continue
+                $chainFails++
+                $script:chainTest = $false
+                Write-Host "$(Get-Date -Format HH:mm:ss) chain probe FAILED ($chainFails/2)"
+                # distinguish: is RDP itself down, or only the tunnel?
+                if (-not (Test-RdpLocal)) {
+                  Write-Host "$(Get-Date -Format HH:mm:ss) direct RDP also down - restarting TermService"
+                  Restart-Service TermService -Force -ErrorAction SilentlyContinue
+                  Start-Sleep -Seconds 5
+                }
+                if ($chainFails -ge 2) {
+                  $needRecycle = $true
+                  $recycleReason = "edge round-trip dead (origin 530) while process alive"
+                }
               }
             }
 
+            if ($needRecycle) {
+              $restarts++
+              $chainFails = 0
+              Write-Host "$(Get-Date -Format HH:mm:ss) RECYCLE #$restarts - $recycleReason"
+              $newUrl = Start-Tunnel
+              if ($newUrl) {
+                $url = $newUrl
+                Start-AccessClient -Url $url | Out-Null
+                Start-Sleep -Seconds 3
+                $script:selfTest = Test-RdpLocal
+                $script:chainTest = Test-TunnelChain
+                Write-Host "TUNNEL_URL=$url (restart #$restarts) chain=$($script:chainTest)"
+                Publish -Url $url -Status "RESTARTED" -Restarts $restarts -Debug (Get-ErrTail)
+              } else {
+                Write-Host "::error::tunnel recycle failed"
+                Publish -Url $url -Status "TUNNEL_DEAD" -Restarts $restarts -Debug (Get-ErrTail)
+              }
+              $lastBeat = Get-Date
+              $lastChainCheck = Get-Date
+              continue
+            }
+
+            # 3. heartbeat every 5 min
             if (((Get-Date) - $lastBeat).TotalMinutes -ge 5) {
               $beat = (Get-Date -Format 'HH:mm:ss')
-              Write-Host "$beat active - tunnel up, restarts=$restarts, left=$($script:minsRemaining)min"
+              Write-Host "$beat active - restarts=$restarts chainFails=$chainFails left=$($script:minsRemaining)min"
               Publish -Url $url -Status "LIVE" -Restarts $restarts -Debug (Get-ErrTail)
               $lastBeat = Get-Date
             }
