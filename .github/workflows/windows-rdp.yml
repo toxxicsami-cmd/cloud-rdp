@@ -1,0 +1,128 @@
+name: WINDOWS RDP - CLOUDFLARE
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: "RDP password (Windows complexity: 8+ chars, upper, lower, number, symbol)"
+        required: false
+        default: "CloudRdp2026!"
+      session_minutes:
+        description: "Session length in minutes (max 360 = 6h)"
+        required: false
+        default: "360"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable Windows RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "RDP enabled, NLA on, firewall open"
+
+      - name: Set RDP password
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
+        run: |
+          $sec = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $sec
+          Write-Host "Password set for runneradmin"
+
+      - name: Start Cloudflare tunnel and capture URL
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "cf-tunnel.log"
+          Start-Process -FilePath "cloudflared" `
+            -ArgumentList "tunnel","--url","tcp://localhost:3389" `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err" `
+            -WindowStyle Hidden
+
+          $url = $null
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            $text = ""
+            foreach ($f in @($log, "$log.err")) {
+              if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
+            }
+            if ($text -match 'https://[a-z0-9-]+\.trycloudflare\.com') {
+              $url = $Matches[0]
+              break
+            }
+          }
+
+          if (-not $url) {
+            Write-Host "::error::Tunnel URL not found in cloudflared output"
+            if (Test-Path $log)     { Get-Content $log }
+            if (Test-Path "$log.err") { Get-Content "$log.err" }
+            exit 1
+          }
+
+          "TUNNEL_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "TUNNEL_URL=$url"
+
+      - name: Print connection details
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
+        run: |
+          $u = $env:TUNNEL_URL -replace '^https://',''
+          $lines = @(
+            "============================================",
+            "  CLOUD RDP IS LIVE",
+            "============================================",
+            "  Tunnel URL : $env:TUNNEL_URL",
+            "  Hostname   : $u",
+            "  Username   : runneradmin",
+            "  Password   : $env:RDP_PASSWORD",
+            "  OS         : Windows Server 2022 (4 vCPU / 16 GB)",
+            "  Internet   : full, GitHub backbone",
+            "============================================",
+            "  CLIENT (run on your PC):",
+            "    cloudflared access tcp --hostname $u --url localhost:13389",
+            "  then open mstsc -> Computer: localhost:13389",
+            "============================================"
+          )
+          $lines | ForEach-Object { Write-Host $_ }
+
+          @"
+          # Cloud RDP ready
+
+          | Field | Value |
+          |---|---|
+          | Tunnel | ``$env:TUNNEL_URL`` |
+          | Hostname | ``$u`` |
+          | Username | ``runneradmin`` |
+          | Password | ``$env:RDP_PASSWORD`` |
+          | Local port | ``13389`` |
+
+          **Client:**
+          ``````bash
+          cloudflared access tcp --hostname $u --url localhost:13389
+          ``````
+          Then ``mstsc /v:localhost:13389``
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep session alive
+        shell: pwsh
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $mins = 360
+          if ($env:SESSION_MINUTES -match '^\d+$') {
+            $v = [int]$env:SESSION_MINUTES
+            if ($v -ge 1 -and $v -le 360) { $mins = $v }
+          }
+          $end = (Get-Date).AddMinutes($mins)
+          Write-Host "Session live until $end (local) - $mins minutes"
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            Write-Host "active $(Get-Date -Format 'HH:mm:ss') / tunnel $env:TUNNEL_URL"
+          }
+          Write-Host "Session window ended - cancel this run if still green"
