@@ -1,8 +1,13 @@
-TUNNEL_URL=https://arguments-great-weight-usb.trycloudflare.com
-HOSTNAME=arguments-great-weight-usb.trycloudflare.com
+TUNNEL_URL=https://williams-gave-samples-throwing.trycloudflare.com
+HOSTNAME=williams-gave-samples-throwing.trycloudflare.com
 USERNAME=runneradmin
 PASSWORD=CloudRdp2026!
 LOCAL_PORT=13389
 RDP_LISTENER=True
-RUN_ID=42037396885
-EXPIRES_UTC=2026-11-05T19:37:55.2752364Z
+RDP_SELFTEST=True
+TUNNEL_STATUS=LIVE
+RESTARTS=0
+RUN_ID=42039599675
+HEARTBEAT_UTC=2026-11-05T13:52:45.1056225Z
+EXPIRES_UTC=2026-11-05T19:52:45.1056225Z
+DEBUG=2026-11-05T13:52:39Z INF precheck complete hard_fail false run_id 1aed5701-bccc-494a-b69f-ec5e2bfa9da3 suggested_protocol quic | 2026-11-05T13:52:39Z INF Registered tunnel connection connIndex 0 connection 67551047-4e88-4feb-ac4c-a4f99ba2ef11 event 0 ip 198.41.200.23 location dfw08 protocol quic
