@@ -18,6 +18,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Setup Cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
       - name: Enable Windows RDP
         shell: pwsh
         run: |
