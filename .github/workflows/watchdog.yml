@@ -16,6 +16,7 @@ jobs:
       - name: Check for a live session and re-fire if the chain stalled
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 

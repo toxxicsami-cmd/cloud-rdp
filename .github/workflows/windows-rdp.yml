@@ -171,11 +171,13 @@ jobs:
             return $t
           }
 
-          # --- session budget: leave 2 minutes of headroom under the 360 job cap ---
-          $script:minsRemaining = 360
+          # --- session budget: job timeout-minutes is 360 and includes setup,
+          # so the serve loop must finish first or GitHub kills the job as
+          # "cancelled" and the relay (success-only) never chains ---
+          $script:minsRemaining = 355
           if ($env:SESSION_MINUTES -match '^\d+$') {
             $v = [int]$env:SESSION_MINUTES
-            if ($v -ge 1 -and $v -le 358) { $script:minsRemaining = $v }
+            if ($v -ge 1 -and $v -le 355) { $script:minsRemaining = $v }
           }
 
           # --- bring tunnel + probe client up ---
